@@ -18,6 +18,8 @@ enum AIProvider: String, CaseIterable, Identifiable {
 // MARK: - Protocol
 protocol AIClient {
     func analyzeImages(_ images: [UIImage], type: MaterialType) async throws -> AnalysisResult
+    /// 텍스트로만 요약 + 키워드 추출 (PDF OCR 결과 처리용, 이미지 없음)
+    func summarizeText(_ text: String) async throws -> AnalysisResult
     func generateQuiz(from text: String, count: Int, difficulty: String) async throws -> [GeneratedQuestion]
     func generateStudyPlan(subjects: [(name: String, avgScore: Double?, materialCount: Int)],
                            examDate: Date) async throws -> [StudyPlanItem]

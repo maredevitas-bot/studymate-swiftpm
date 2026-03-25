@@ -2,6 +2,7 @@ import SwiftUI
 import PDFKit
 import PencilKit
 import VisionKit
+import Vision
 import SwiftData
 
 struct MaterialImportView: View {
@@ -185,36 +186,98 @@ struct MaterialImportView: View {
 
     private func handlePDFImport(result: Result<URL, Error>) async {
         guard case .success(let url) = result else { return }
-        // Fix 2: Surface security-scoped resource access denial to the user
         guard url.startAccessingSecurityScopedResource() else {
             await MainActor.run { errorMessage = "파일 접근 권한이 없습니다." }
             return
         }
         defer { url.stopAccessingSecurityScopedResource() }
         guard let pdf = PDFDocument(url: url) else {
-            errorMessage = "PDF를 열 수 없어요."
+            await MainActor.run { errorMessage = "PDF를 열 수 없어요." }
             return
         }
-        isAnalyzing = true
-        var images: [UIImage] = []
+        await MainActor.run { isAnalyzing = true }
+
+        do {
+            // 1단계: 모든 페이지를 로컬 OCR로 텍스트 추출 (API 호출 없음)
+            let extractedText = try await extractTextFromPDF(pdf)
+
+            // 2단계: 텍스트만으로 Gemini에 요약/키워드 요청 (이미지 0개, 1회 호출)
+            try await analyzeAndSaveText(extractedText: extractedText, type: .ppt)
+        } catch {
+            await MainActor.run { errorMessage = error.localizedDescription }
+        }
+        await MainActor.run { isAnalyzing = false }
+    }
+
+    /// PDF 전체 페이지를 로컬 Vision OCR로 텍스트 추출
+    private func extractTextFromPDF(_ pdf: PDFDocument) async throws -> String {
+        var pageTexts: [String] = []
+
         for i in 0..<min(pdf.pageCount, 20) {
-            if let page = pdf.page(at: i) {
-                let bounds = page.bounds(for: .mediaBox)
-                let renderer = UIGraphicsImageRenderer(size: bounds.size)
-                let img = renderer.image { ctx in
-                    UIColor.white.setFill()
-                    ctx.fill(bounds)
-                    page.draw(with: .mediaBox, to: ctx.cgContext)
-                }
-                images.append(img)
+            guard let page = pdf.page(at: i) else { continue }
+
+            // PDFKit 내장 텍스트 우선 사용
+            let pdfText = page.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if pdfText.count > 30 {
+                pageTexts.append(pdfText)
+                continue
+            }
+
+            // 텍스트 없는 페이지(이미지)는 Vision OCR로 처리
+            let bounds = page.bounds(for: .mediaBox)
+            let scale = min(1024 / max(bounds.width, bounds.height), 2.0)
+            let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+            let renderer = UIGraphicsImageRenderer(size: size)
+            let img = renderer.image { ctx in
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: size))
+                ctx.cgContext.scaleBy(x: scale, y: scale)
+                page.draw(with: .mediaBox, to: ctx.cgContext)
+            }
+
+            if let cgImage = img.cgImage {
+                let ocrText = try await recognizeText(from: cgImage)
+                if !ocrText.isEmpty { pageTexts.append(ocrText) }
             }
         }
-        do {
-            try await analyzeAndSave(images: images, type: .ppt, drawingData: nil)
-        } catch {
-            errorMessage = error.localizedDescription
+
+        return pageTexts.joined(separator: "\n\n")
+    }
+
+    /// Vision 프레임워크로 로컬 OCR (한국어 + 영어)
+    private func recognizeText(from cgImage: CGImage) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let request = VNRecognizeTextRequest { request, error in
+                if let error { continuation.resume(throwing: error); return }
+                let text = (request.results as? [VNRecognizedTextObservation] ?? [])
+                    .compactMap { $0.topCandidates(1).first?.string }
+                    .joined(separator: " ")
+                continuation.resume(returning: text)
+            }
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["ko-KR", "en-US"]
+            request.usesLanguageCorrection = true
+
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do { try handler.perform([request]) }
+            catch { continuation.resume(throwing: error) }
         }
-        isAnalyzing = false
+    }
+
+    /// 텍스트만으로 AI 요약 요청 (이미지 없음 → 토큰 최소)
+    private func analyzeAndSaveText(extractedText: String, type: MaterialType) async throws {
+        let analysis = try await AIClientFactory.current().summarizeText(extractedText)
+        let materialTitle = await MainActor.run { title.isEmpty ? "자료 \(subject.materials.count + 1)" : title }
+        let material = Material(type: type, title: materialTitle)
+        material.extractedText = extractedText
+        material.summary = analysis.summary
+        material.highlights = analysis.highlights
+        material.subject = subject
+        try await MainActor.run {
+            modelContext.insert(material)
+            try modelContext.save()
+            dismiss()
+        }
     }
 
     // Fix 4: Removed @MainActor so heavy I/O (saveAll, analyzeImages) runs off the main thread.

@@ -135,6 +135,23 @@ actor ClaudeAPIClient: AIClient {
         return try parseJSON(responseText, as: [StudyPlanItem].self)
     }
 
+    // MARK: Summarize (텍스트 → AnalysisResult, 이미지 없음)
+    func summarizeText(_ text: String) async throws -> AnalysisResult {
+        let prompt = """
+        다음 수업 자료 내용을 분석해주세요.
+        JSON 형식으로만 응답 (마크다운 없이):
+        {"extractedText": "전체 텍스트", "summary": "핵심 내용 요약 3~5문장", "highlights": ["키워드1","키워드2","키워드3","키워드4","키워드5"]}
+
+        자료:
+        \(text.prefix(6000))
+        """
+        let responseText = try await callClaude(
+            model: "claude-haiku-4-5-20251001",
+            content: [["type": "text", "text": prompt]],
+            maxTokens: 1000)
+        return try parseJSON(responseText, as: AnalysisResult.self)
+    }
+
     // MARK: Summarize (cheap model)
     func summarize(text: String) async throws -> String {
         let prompt = "다음 내용을 3문장으로 간결하게 요약해주세요:\n\(text.prefix(2000))"
