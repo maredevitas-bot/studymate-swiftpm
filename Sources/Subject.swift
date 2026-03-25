@@ -10,6 +10,8 @@ final class Subject {
     var materials: [Material] = []
     @Relationship(deleteRule: .cascade, inverse: \QuizSession.subject)
     var quizSessions: [QuizSession] = []
+    @Relationship(deleteRule: .cascade, inverse: \NoteBook.subject)
+    var notebooks: [NoteBook] = []
 
     init(name: String, teacher: String, colorHex: String = "#4A90D9") {
         self.name = name

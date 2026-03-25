@@ -5,6 +5,7 @@ struct SubjectDetailView: View {
     @Bindable var subject: Subject
     @State private var showImport = false
     @State private var showQuiz = false
+    @Environment(\.modelContext) private var modelContext
 
     private var analyzedMaterials: [Material] {
         subject.materials.filter { !$0.extractedText.isEmpty }
@@ -32,6 +33,9 @@ struct SubjectDetailView: View {
                 }
                 .foregroundStyle(.blue)
             }
+
+            // Notes section
+            NotebookListSection(subject: subject)
 
             // Quiz section
             Section("퀴즈") {

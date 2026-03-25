@@ -8,7 +8,8 @@ struct StudyMateApp: App {
     init() {
         let schema = Schema([
             School.self, Subject.self, Material.self,
-            QuizSession.self, Question.self, PlanEntry.self
+            QuizSession.self, Question.self, PlanEntry.self,
+            NoteBook.self, NotePage.self
         ])
         let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
