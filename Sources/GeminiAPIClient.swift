@@ -196,14 +196,9 @@ actor GeminiAPIClient: AIClient {
             throw GeminiError.networkError(error)
         }
 
-        // 429 시 최대 3회 재시도 (2s → 4s → 8s)
+        // 429 시 최대 3회 재시도 — Retry-After 헤더 우선, 없으면 30s→60s→120s
         var lastError: Error = GeminiError.parseError("Unknown")
         for attempt in 0..<3 {
-            if attempt > 0 {
-                let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
-                try await Task.sleep(nanoseconds: delay)
-            }
-
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -214,17 +209,24 @@ actor GeminiAPIClient: AIClient {
                 (data, response) = try await URLSession.shared.data(for: request)
             } catch {
                 lastError = GeminiError.networkError(error)
-                continue
+                break   // 네트워크 오류는 재시도 의미 없음
             }
 
             guard let http = response as? HTTPURLResponse else {
                 lastError = GeminiError.parseError("Non-HTTP response")
-                continue
+                break
             }
 
             if http.statusCode == 429 {
                 let body = String(data: data, encoding: .utf8) ?? ""
                 lastError = GeminiError.invalidResponse(http.statusCode, body)
+                guard attempt < 2 else { break }
+
+                // Retry-After 헤더 확인 (초 단위)
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+                    .flatMap { Double($0) } ?? Double([30, 60, 120][attempt])
+                let waitNs = UInt64(retryAfter * 1_000_000_000)
+                try await Task.sleep(nanoseconds: waitNs)
                 continue
             }
 
