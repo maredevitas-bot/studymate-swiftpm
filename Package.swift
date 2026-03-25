@@ -31,8 +31,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "StudyMate",
-            path: "Sources",
-            resources: [.process("Info.plist")]
+            path: "Sources"
         )
     ]
 )
