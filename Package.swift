@@ -1,13 +1,5 @@
-// swift-tools-version: 5.7
+// swift-tools-version: 5.8
 import PackageDescription
-
-let families: [SupportedDeviceFamily] = [.pad, .phone]
-let orientations: [InterfaceOrientation] = [
-    .portrait,
-    .landscapeRight,
-    .landscapeLeft,
-    .portraitUpsideDown
-]
 
 let package = Package(
     name: "StudyMate",
@@ -22,8 +14,12 @@ let package = Package(
             teamIdentifier: "",
             displayVersion: "1.0",
             bundleVersion: "1",
-            supportedDeviceFamilies: families,
-            supportedInterfaceOrientations: orientations
+            supportedDeviceFamilies: [.pad, .phone],
+            supportedInterfaceOrientations: [
+                .portrait,
+                .landscapeRight,
+                .landscapeLeft
+            ]
         )
     ],
     targets: [
