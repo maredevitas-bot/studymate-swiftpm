@@ -144,13 +144,18 @@ actor GeminiAPIClient: AIClient {
 
     // MARK: Summarize (텍스트 → AnalysisResult, 이미지 없음)
     func summarizeText(_ text: String) async throws -> AnalysisResult {
+        // extractedText는 이미 로컬에 있으므로 요약과 키워드만 요청 (출력 토큰 최소화)
         let prompt = """
-        다음 수업 자료 내용을 분석해주세요.
-        JSON 형식으로만 응답 (마크다운 없이):
-        {"extractedText": \(jsonEscape(String(text.prefix(6000)))), "summary": "핵심 내용 요약 3~5문장", "highlights": ["키워드1","키워드2","키워드3","키워드4","키워드5"]}
+        다음 수업 자료를 분석해 요약과 핵심 키워드만 JSON으로 응답해주세요 (마크다운 없이):
+        {"summary": "3~5문장 요약", "highlights": ["키워드1","키워드2","키워드3","키워드4","키워드5"]}
+
+        자료 (앞부분):
+        \(text.prefix(2000))
         """
-        let responseText = try await callGemini(parts: [["text": prompt]], maxTokens: 1000)
-        return try parseJSON(responseText, as: AnalysisResult.self)
+        struct SummaryOnly: Decodable { let summary: String; let highlights: [String] }
+        let responseText = try await callGemini(parts: [["text": prompt]], maxTokens: 400)
+        let result = try parseJSON(responseText, as: SummaryOnly.self)
+        return AnalysisResult(extractedText: text, summary: result.summary, highlights: result.highlights)
     }
 
     func summarize(text: String) async throws -> String {

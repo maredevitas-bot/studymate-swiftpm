@@ -138,18 +138,19 @@ actor ClaudeAPIClient: AIClient {
     // MARK: Summarize (텍스트 → AnalysisResult, 이미지 없음)
     func summarizeText(_ text: String) async throws -> AnalysisResult {
         let prompt = """
-        다음 수업 자료 내용을 분석해주세요.
-        JSON 형식으로만 응답 (마크다운 없이):
-        {"extractedText": "전체 텍스트", "summary": "핵심 내용 요약 3~5문장", "highlights": ["키워드1","키워드2","키워드3","키워드4","키워드5"]}
+        다음 수업 자료를 분석해 요약과 핵심 키워드만 JSON으로 응답해주세요 (마크다운 없이):
+        {"summary": "3~5문장 요약", "highlights": ["키워드1","키워드2","키워드3","키워드4","키워드5"]}
 
-        자료:
-        \(text.prefix(6000))
+        자료 (앞부분):
+        \(text.prefix(2000))
         """
+        struct SummaryOnly: Decodable { let summary: String; let highlights: [String] }
         let responseText = try await callClaude(
             model: "claude-haiku-4-5-20251001",
             content: [["type": "text", "text": prompt]],
-            maxTokens: 1000)
-        return try parseJSON(responseText, as: AnalysisResult.self)
+            maxTokens: 400)
+        let result = try parseJSON(responseText, as: SummaryOnly.self)
+        return AnalysisResult(extractedText: text, summary: result.summary, highlights: result.highlights)
     }
 
     // MARK: Summarize (cheap model)
