@@ -7,24 +7,23 @@ struct SubjectsTabView: View {
     @Query(sort: \Subject.name) private var subjects: [Subject]
     @State private var showAddSheet = false
     @State private var selectedSubject: Subject?
+    @State private var subjectToDelete: Subject?
 
     var body: some View {
         if horizontalSizeClass == .compact {
-            // iPhone: 기존 NavigationStack
             NavigationStack {
                 subjectList
                     .navigationTitle("과목")
-                    .toolbar { addButton }
+                    .toolbar { addButton; editButton }
                     .sheet(isPresented: $showAddSheet) {
                         AddSubjectSheet(subjectCount: subjects.count)
                     }
             }
         } else {
-            // iPad: NavigationSplitView
             NavigationSplitView {
                 subjectList
                     .navigationTitle("과목")
-                    .toolbar { addButton }
+                    .toolbar { addButton; editButton }
                     .sheet(isPresented: $showAddSheet) {
                         AddSubjectSheet(subjectCount: subjects.count)
                     }
@@ -54,9 +53,16 @@ struct SubjectsTabView: View {
                         NavigationLink(value: subject) {
                             SubjectRowView(subject: subject)
                         }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                subjectToDelete = subject
+                            } label: {
+                                Label("삭제", systemImage: "trash")
+                            }
+                        }
                     }
                     .onDelete { offsets in
-                        offsets.forEach { modelContext.delete(group.subjects[$0]) }
+                        offsets.forEach { subjectToDelete = group.subjects[$0] }
                     }
                 }
             }
@@ -71,6 +77,22 @@ struct SubjectsTabView: View {
                 )
             }
         }
+        .confirmationDialog(
+            "'\(subjectToDelete?.name ?? "")' 과목을 삭제할까요?",
+            isPresented: Binding(
+                get: { subjectToDelete != nil },
+                set: { if !$0 { subjectToDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("삭제", role: .destructive) {
+                if let s = subjectToDelete { modelContext.delete(s) }
+                subjectToDelete = nil
+            }
+            Button("취소", role: .cancel) { subjectToDelete = nil }
+        } message: {
+            Text("자료, 퀴즈 기록이 모두 삭제됩니다.")
+        }
     }
 
     var addButton: some ToolbarContent {
@@ -78,6 +100,12 @@ struct SubjectsTabView: View {
             Button { showAddSheet = true } label: {
                 Image(systemName: "plus")
             }
+        }
+    }
+
+    var editButton: some ToolbarContent {
+        ToolbarItem(placement: .navigationBarLeading) {
+            EditButton()
         }
     }
 
