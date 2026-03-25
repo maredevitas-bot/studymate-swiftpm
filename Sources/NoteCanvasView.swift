@@ -1,4 +1,3 @@
-// StudyMate/Features/Subjects/NoteCanvasView.swift
 import SwiftUI
 import PencilKit
 
@@ -9,9 +8,14 @@ struct NoteCanvasView: UIViewRepresentable {
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
         canvas.drawing = drawing
-        canvas.drawingPolicy = .anyInput   // finger + Apple Pencil 모두 허용
+        // Apple Pencil만 필기 가능, 손가락은 스크롤·확대/축소
+        canvas.drawingPolicy = .pencilOnly
         canvas.backgroundColor = .white
         canvas.isOpaque = true
+        canvas.isScrollEnabled = true
+        canvas.alwaysBounceVertical = true
+        canvas.minimumZoomScale = 0.25
+        canvas.maximumZoomScale = 5.0
         canvas.delegate = context.coordinator
 
         if isEditable {
