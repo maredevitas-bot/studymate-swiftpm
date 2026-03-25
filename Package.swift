@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 5.5
 import PackageDescription
 
 let package = Package(
@@ -10,22 +10,10 @@ let package = Package(
         .iOSApplication(
             name: "StudyMate",
             targets: ["StudyMate"],
-            bundleIdentifier: "com.studymate.app",
+            bundleIdentifier: "com.yvc.studymate",
             teamIdentifier: "",
             displayVersion: "1.0",
-            bundleVersion: "1",
-            appIcon: .placeholder(icon: .blue),
-            accentColor: .presetColor(.blue),
-            supportedDeviceFamilies: [
-                .pad,
-                .phone
-            ],
-            supportedInterfaceOrientations: [
-                .portrait,
-                .landscapeRight,
-                .landscapeLeft,
-                .portraitUpsideDown(.when(deviceFamilies: [.pad]))
-            ]
+            bundleVersion: "1"
         )
     ],
     targets: [
