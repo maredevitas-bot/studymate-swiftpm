@@ -14,7 +14,7 @@ let package = Package(
             targets: ["StudyMate"],
             displayVersion: "1.0",
             bundleVersion: "1",
-            appIcon: .placeholder(icon: .book),
+            appIcon: .placeholder(icon: .pencil),
             accentColor: .presetColor(.blue),
             supportedDeviceFamilies: [
                 .pad,
