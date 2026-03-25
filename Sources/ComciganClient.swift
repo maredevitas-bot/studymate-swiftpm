@@ -24,35 +24,45 @@ enum ComciganError: Error, LocalizedError {
 actor ComciganClient {
     static let shared = ComciganClient()
 
-    private let baseURL = "http://comcigan.com"
+    // HTTPS → HTTP 순으로 시도
+    private let bases = ["https://comcigan.com", "http://comcigan.com"]
+    private var resolvedBase: String?
     private var resolvedSearchPath: String?
 
-    private func makeSession() -> URLSession {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 10
-        return URLSession(configuration: cfg)
+    private func makeRequest(url: URL) -> URLRequest {
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.setValue(
+            "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            forHTTPHeaderField: "User-Agent"
+        )
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        req.setValue("https://comcigan.com", forHTTPHeaderField: "Referer")
+        return req
     }
 
-    // MARK: - 메인 페이지에서 실제 검색 경로 추출
+    // MARK: - 메인 페이지에서 검색 경로 추출
 
-    private func resolveSearchPath() async -> String? {
-        guard let url = URL(string: "\(baseURL)/st"),
-              let (data, _) = try? await makeSession().data(from: url) else { return nil }
+    private func resolveEndpoint() async {
+        for base in bases {
+            guard let url = URL(string: "\(base)/st") else { continue }
+            guard let (data, resp) = try? await URLSession.shared.data(for: makeRequest(url: url)),
+                  (resp as? HTTPURLResponse)?.statusCode == 200 else { continue }
 
-        let html = String(data: data, encoding: .utf8)
-                ?? String(data: data, encoding: .isoLatin1) ?? ""
+            resolvedBase = base
 
-        // JS 코드 예: getJSON("st/sc5?q="+encodeURIComponent(nm)
-        // 숫자 붙은 경로(sc2~sc9)나 sch를 찾는다
-        let pattern = #"["']((?:st/|/)sc\w*)[?]["']"#
-        if let regex = try? NSRegularExpression(pattern: pattern),
-           let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
-           let r = Range(match.range(at: 1), in: html) {
-            var path = String(html[r])
-            if !path.hasPrefix("/") { path = "/" + path }
-            return path
+            let html = String(data: data, encoding: .utf8)
+                    ?? String(data: data, encoding: .isoLatin1) ?? ""
+
+            // getJSON("st/sc5?q=  또는  $.get("st/sch?q=
+            if let regex = try? NSRegularExpression(pattern: #"["']((?:st/|/)sc\w*)[?]["']"#),
+               let m = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+               let r = Range(m.range(at: 1), in: html) {
+                var path = String(html[r])
+                if !path.hasPrefix("/") { path = "/" + path }
+                resolvedSearchPath = path
+            }
+            return
         }
-        return nil
     }
 
     // MARK: - 학교 검색
@@ -62,29 +72,29 @@ actor ComciganClient {
             throw ComciganError.parseError("인코딩 실패")
         }
 
-        // 첫 호출 시 실제 경로 추출
-        if resolvedSearchPath == nil {
-            resolvedSearchPath = await resolveSearchPath()
-        }
+        if resolvedBase == nil { await resolveEndpoint() }
+        let base = resolvedBase ?? "https://comcigan.com"
 
-        // 시도 경로 목록: 동적 추출 결과 + 버전별 알려진 경로
-        var candidates: [String] = []
-        if let p = resolvedSearchPath { candidates.append(p) }
+        // 시도할 경로 목록
+        var paths: [String] = []
+        if let p = resolvedSearchPath { paths.append(p) }
         for p in ["/st/sc5", "/st/sc4", "/st/sc3", "/st/sc2", "/st/sch", "/st/sc"] {
-            if !candidates.contains(p) { candidates.append(p) }
+            if !paths.contains(p) { paths.append(p) }
         }
 
         var lastRaw = ""
-        for path in candidates {
-            guard let url = URL(string: "\(baseURL)\(path)?q=\(encoded)"),
-                  let (data, _) = try? await makeSession().data(from: url),
+        for path in paths {
+            guard let url = URL(string: "\(base)\(path)?q=\(encoded)") else { continue }
+            guard let (data, _) = try? await URLSession.shared.data(for: makeRequest(url: url)),
                   !data.isEmpty else { continue }
 
             if let results = parseSchoolResponse(data: data), !results.isEmpty {
-                resolvedSearchPath = path   // 성공한 경로 캐시
+                resolvedSearchPath = path
                 return results
             }
-            lastRaw = String(data: data, encoding: .utf8)?.prefix(300).description ?? ""
+            if lastRaw.isEmpty {
+                lastRaw = String(data: data, encoding: .utf8)?.prefix(400).description ?? "(binary)"
+            }
         }
 
         if lastRaw.isEmpty {
@@ -93,10 +103,9 @@ actor ComciganClient {
         throw ComciganError.parseError("응답: \(lastRaw)")
     }
 
-    // MARK: - 응답 파싱 (여러 형식 대응)
+    // MARK: - 응답 파싱
 
     private func parseSchoolResponse(data: Data) -> [SchoolResult]? {
-        // JSON 파싱 (UTF-8, EUC-KR 순)
         var json: [String: Any]?
         if let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             json = j
@@ -107,7 +116,7 @@ actor ComciganClient {
         }
         guard let json else { return nil }
 
-        // 키 후보 우선 탐색, 없으면 첫 번째 배열 값 사용
+        // 키 후보 탐색 → 없으면 첫 번째 배열값 사용
         let keyCandidates = ["학교", "학교검색", "학교목록", "result", "data", "list"]
         var rows: [[Any]]?
         for key in keyCandidates {
@@ -119,25 +128,22 @@ actor ComciganClient {
         guard let rows, !rows.isEmpty else { return nil }
 
         return rows.compactMap { row -> SchoolResult? in
-            // 형식 A: [Int코드, String이름, String지역]  ← 컴시간 일반
-            if row.count >= 2,
-               let code = (row[0] as? Int).map(String.init),
+            guard row.count >= 2 else { return nil }
+            // [Int코드, String이름, String지역]
+            if let code = (row[0] as? Int).map(String.init),
                let name = row[1] as? String {
                 let region = row.count > 2 ? (row[2] as? String ?? "") : ""
                 return SchoolResult(name: name, code: code, region: region)
             }
-            // 형식 B: [Int교육청코드, Int학교코드, String이름, String지역]
-            if row.count >= 3,
-               row[0] is Int,
+            // [Int교육청코드, Int학교코드, String이름, String지역]
+            if row[0] is Int,
                let code = (row[1] as? Int).map(String.init),
                let name = row[2] as? String {
                 let region = row.count > 3 ? (row[3] as? String ?? "") : ""
                 return SchoolResult(name: name, code: code, region: region)
             }
-            // 형식 C: [String이름, String코드]
-            if row.count >= 2,
-               let name = row[0] as? String,
-               let code = row[1] as? String {
+            // [String이름, String코드]
+            if let name = row[0] as? String, let code = row[1] as? String {
                 return SchoolResult(name: name, code: code, region: "")
             }
             return nil
@@ -147,14 +153,13 @@ actor ComciganClient {
     // MARK: - 시간표 조회
 
     func fetchTimetable(schoolCode: String, grade: Int, classNum: Int) async throws -> [[String]] {
-        let paths = ["/st/tt", "/st/tt2", "/st/timetable"]
-        for path in paths {
-            guard let url = URL(string: "\(baseURL)\(path)?s=\(schoolCode)&g=\(grade)&c=\(classNum)"),
-                  let (data, _) = try? await makeSession().data(from: url),
+        let base = resolvedBase ?? "https://comcigan.com"
+        for path in ["/st/tt", "/st/tt2", "/st/timetable"] {
+            guard let url = URL(string: "\(base)\(path)?s=\(schoolCode)&g=\(grade)&c=\(classNum)"),
+                  let (data, _) = try? await URLSession.shared.data(for: makeRequest(url: url)),
                   !data.isEmpty,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-
             for key in ["시간표", "timetable", "result", "data"] {
                 if let table = json[key] as? [[String]] { return table }
             }

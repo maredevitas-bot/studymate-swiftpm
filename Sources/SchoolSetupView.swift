@@ -89,11 +89,12 @@ struct SchoolSetupView: View {
         }
     }
 
+    @MainActor
     private func loadTimetable(school: School) async {
         do {
             let table = try await ComciganClient.shared.fetchTimetable(
                 schoolCode: school.code, grade: school.grade, classNum: school.classNum)
-            await createSubjectsFromTimetable(table)
+            createSubjectsFromTimetable(table)
         } catch {
             // 시간표 로드 실패 시 무시 — 과목은 수동 추가 가능
         }
