@@ -24,94 +24,124 @@ enum ComciganError: Error, LocalizedError {
 actor ComciganClient {
     static let shared = ComciganClient()
 
-    private func makeSession() -> URLSession {
+    private let base = "http://comcigan.com"
+
+    // 쿠키를 유지하는 전용 URLSession
+    private let session: URLSession = {
         let cfg = URLSessionConfiguration.default
+        cfg.httpCookieStorage = HTTPCookieStorage.shared
+        cfg.httpCookieAcceptPolicy = .always
         cfg.timeoutIntervalForRequest = 15
         cfg.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Accept": "*/*"
+            "Accept-Language": "ko-KR,ko;q=0.9"
         ]
         return URLSession(configuration: cfg)
+    }()
+
+    private var sessionReady = false
+
+    // MARK: - PHP 세션 초기화 (PHPSESSID 쿠키 획득)
+
+    private func ensureSession() async {
+        guard !sessionReady else { return }
+        guard let url = URL(string: "\(base)/st/") else { return }
+        _ = try? await session.data(from: url)
+        sessionReady = true
     }
 
     // MARK: - 학교 검색
 
     func searchSchool(name: String) async throws -> [SchoolResult] {
-        guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
-            throw ComciganError.parseError("인코딩 실패")
+        await ensureSession()
+
+        // EUC-KR URL 인코딩 (컴시간 서버 요구 사항)
+        let eucKR = String.Encoding(rawValue:
+            CFStringConvertEncodingToNSStringEncoding(
+                CFStringEncoding(CFStringEncodings.EUC_KR.rawValue)
+            )
+        )
+        let encodedQuery: String
+        if let data = name.data(using: eucKR) {
+            encodedQuery = data.map { String(format: "%%%02X", $0) }.joined()
+        } else {
+            encodedQuery = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? name
         }
 
-        // 응답이 왔던 URL부터 시도
-        let urlStrings = [
-            "https://comcigan.com/st/sch?q=\(encoded)",
-            "http://comcigan.com/st/sch?q=\(encoded)",
-            "https://comcigan.com/st/sc5?q=\(encoded)",
-            "http://comcigan.com/st/sc5?q=\(encoded)",
+        let urlCandidates = [
+            "\(base)/st/sch?q=\(encodedQuery)",
+            "\(base)/st/sc5?q=\(encodedQuery)",
+            "\(base)/st/sc4?q=\(encodedQuery)",
         ]
 
-        var lastError: String = "모든 경로 연결 실패"
+        var lastRaw = ""
 
-        for urlStr in urlStrings {
+        for urlStr in urlCandidates {
             guard let url = URL(string: urlStr) else { continue }
 
             let data: Data
             do {
-                (data, _) = try await makeSession().data(from: url)
+                (data, _) = try await session.data(from: url)
             } catch {
-                lastError = "네트워크: \(error.localizedDescription)"
+                lastRaw = "네트워크: \(error.localizedDescription)"
                 continue
             }
 
             guard !data.isEmpty else { continue }
 
-            // 항상 raw 저장 (마지막 시도용 디버그)
-            let raw = String(data: data, encoding: .utf8)
-                   ?? String(data: data, encoding: .isoLatin1)
-                   ?? "(binary)"
-            lastError = String(raw.prefix(500))
+            // EUC-KR → UTF-8 변환
+            let raw = decodeResponse(data)
+            lastRaw = String(raw.prefix(500))
 
-            if let results = parseResponse(data: data, raw: raw), !results.isEmpty {
+            if let results = parseSchoolList(raw), !results.isEmpty {
                 return results
             }
         }
 
-        throw ComciganError.parseError(lastError)
+        throw ComciganError.parseError(lastRaw)
     }
 
-    // MARK: - 파싱 (딕셔너리 / 배열 모두 지원)
+    // MARK: - EUC-KR 디코딩
 
-    private func parseResponse(data: Data, raw: String) -> [SchoolResult]? {
-        // UTF-8 실패 시 EUC-KR(isoLatin1)으로 재시도
-        func toData(_ str: String) -> Data? { str.data(using: .utf8) }
-        let parseData = (String(data: data, encoding: .utf8) != nil)
-                      ? data
-                      : (toData(raw) ?? data)
+    private func decodeResponse(_ data: Data) -> String {
+        if let s = String(data: data, encoding: .utf8) { return s }
+        let eucKR = String.Encoding(rawValue:
+            CFStringConvertEncodingToNSStringEncoding(
+                CFStringEncoding(CFStringEncodings.EUC_KR.rawValue)
+            )
+        )
+        if let s = String(data: data, encoding: eucKR) { return s }
+        return String(data: data, encoding: .isoLatin1) ?? ""
+    }
 
-        guard let obj = try? JSONSerialization.jsonObject(with: parseData) else { return nil }
+    // MARK: - 파싱
 
-        // 형식 1: 최상위가 딕셔너리 {"학교": [[...]]}
+    private func parseSchoolList(_ raw: String) -> [SchoolResult]? {
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        var rows: [[Any]]?
+
+        // 딕셔너리: {"학교": [[...]]}
         if let dict = obj as? [String: Any] {
-            let keys = ["학교", "학교검색", "학교목록", "result", "data", "list"]
-            for key in keys {
-                if let rows = dict[key] as? [[Any]], let r = mapRows(rows) { return r }
+            for key in ["학교", "학교검색", "학교목록", "result", "data"] {
+                if let r = dict[key] as? [[Any]] { rows = r; break }
             }
-            // 키를 모르면 첫 번째 배열 값 시도
-            for val in dict.values {
-                if let rows = val as? [[Any]], let r = mapRows(rows) { return r }
+            if rows == nil {
+                rows = dict.values.compactMap { $0 as? [[Any]] }.first
             }
         }
+        // 최상위 배열: [[...]]
+        if rows == nil, let r = obj as? [[Any]] { rows = r }
 
-        // 형식 2: 최상위가 배열 [[...]]
-        if let rows = obj as? [[Any]], let r = mapRows(rows) { return r }
-
-        return nil
+        guard let rows, !rows.isEmpty else { return nil }
+        return mapRows(rows)
     }
 
     private func mapRows(_ rows: [[Any]]) -> [SchoolResult]? {
         let results = rows.compactMap { row -> SchoolResult? in
             guard row.count >= 2 else { return nil }
-
-            // [Int코드, String이름] 또는 [Int코드, String이름, String지역]
+            // [Int코드, String이름, String지역]
             if let code = (row[0] as? Int).map(String.init),
                let name = row[1] as? String {
                 let region = row.count > 2 ? (row[2] as? String ?? "") : ""
@@ -136,20 +166,19 @@ actor ComciganClient {
     // MARK: - 시간표
 
     func fetchTimetable(schoolCode: String, grade: Int, classNum: Int) async throws -> [[String]] {
-        let urlStrings = [
-            "https://comcigan.com/st/tt?s=\(schoolCode)&g=\(grade)&c=\(classNum)",
-            "http://comcigan.com/st/tt?s=\(schoolCode)&g=\(grade)&c=\(classNum)",
-        ]
-        for urlStr in urlStrings {
-            guard let url = URL(string: urlStr),
-                  let (data, _) = try? await makeSession().data(from: url),
-                  !data.isEmpty,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            for key in ["시간표", "timetable", "result", "data"] {
-                if let table = json[key] as? [[String]] { return table }
-            }
+        await ensureSession()
+        let url = URL(string: "\(base)/st/tt?s=\(schoolCode)&g=\(grade)&c=\(classNum)")!
+        guard let (data, _) = try? await session.data(from: url), !data.isEmpty else {
+            throw ComciganError.parseError("시간표 요청 실패")
         }
-        throw ComciganError.parseError("시간표를 불러올 수 없어요.")
+        let raw = decodeResponse(data)
+        guard let jsonData = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+        else { throw ComciganError.parseError("시간표 파싱 실패") }
+
+        for key in ["시간표", "timetable", "result", "data"] {
+            if let table = json[key] as? [[String]] { return table }
+        }
+        throw ComciganError.parseError("시간표 키 없음")
     }
 }
