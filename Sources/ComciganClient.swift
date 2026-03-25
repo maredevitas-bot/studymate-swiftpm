@@ -114,20 +114,23 @@ actor ComciganClient {
     // MARK: - HTML 파싱 헬퍼
 
     private func extractFrameSrc(from html: String) -> String? {
-        // <frame ... src="http://..."  대소문자 무관
-        let lower = html.lowercased().replacingOccurrences(of: "'", with: "\"")
+        // 실제 형식: <FRAME src='http://comci.net:4082/st'>  (싱글쿼트, 대문자)
+        // 싱글쿼트 → 더블쿼트로 치환 후 파싱
+        let normalized = html.replacingOccurrences(of: "'", with: "\"")
         guard let regex = try? NSRegularExpression(pattern: #"<frame[^>]+src="([^"]+)""#, options: .caseInsensitive),
-              let m = regex.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)),
-              let r = Range(m.range(at: 1), in: lower) else { return nil }
-        return String(lower[r])
+              let m = regex.firstMatch(in: normalized, range: NSRange(normalized.startIndex..., in: normalized)),
+              let r = Range(m.range(at: 1), in: normalized) else { return nil }
+        return String(normalized[r])
     }
 
     private func extractSchoolRaPath(from source: String) -> String? {
-        // school_ra(sc) ... url:'...'  패턴
+        // 실제 형식: url:'./36179?17384l'
+        // JS 정규식과 동일: url:'.(.*?)' → 첫 글자('.')를 건너뛰고 나머지 캡처
+        // → '/36179?17384l' (도트 제외, 슬래시 포함)
         guard let idx = source.range(of: "school_ra(sc)") else { return nil }
         let snippet = String(source[idx.lowerBound...].prefix(200))
             .replacingOccurrences(of: " ", with: "")
-        guard let regex = try? NSRegularExpression(pattern: #"url:'([^']+)'"#),
+        guard let regex = try? NSRegularExpression(pattern: #"url:'.([^']+)'"#),
               let m = regex.firstMatch(in: snippet, range: NSRange(snippet.startIndex..., in: snippet)),
               let r = Range(m.range(at: 1), in: snippet) else { return nil }
         return String(snippet[r])
