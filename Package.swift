@@ -1,5 +1,7 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.9
+
 import PackageDescription
+import AppleProductTypes
 
 let package = Package(
     name: "StudyMate",
@@ -10,15 +12,19 @@ let package = Package(
         .iOSApplication(
             name: "StudyMate",
             targets: ["StudyMate"],
-            bundleIdentifier: "com.yvc.studymate",
-            teamIdentifier: "",
             displayVersion: "1.0",
             bundleVersion: "1",
-            supportedDeviceFamilies: [.pad, .phone],
+            appIcon: .placeholder(icon: .book),
+            accentColor: .presetColor(.blue),
+            supportedDeviceFamilies: [
+                .pad,
+                .phone
+            ],
             supportedInterfaceOrientations: [
                 .portrait,
                 .landscapeRight,
-                .landscapeLeft
+                .landscapeLeft,
+                .portraitUpsideDown(.when(deviceFamilies: [.pad]))
             ]
         )
     ],
