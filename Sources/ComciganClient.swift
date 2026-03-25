@@ -3,22 +3,20 @@ import Foundation
 struct SchoolResult: Identifiable {
     let id = UUID()
     let name: String
-    let code: String      // 학교 코드 (숫자 문자열)
-    let region: String    // 지역명
+    let code: String
+    let region: String
 }
 
 enum ComciganError: Error, LocalizedError {
     case networkError(Error)
     case parseError(String)
     case schoolNotFound
-    case routingFailed
 
     var errorDescription: String? {
         switch self {
         case .networkError(let e): return "네트워크 오류: \(e.localizedDescription)"
         case .parseError(let s):   return "파싱 오류: \(s)"
         case .schoolNotFound:      return "학교를 찾을 수 없어요."
-        case .routingFailed:       return "컴시간 서버 응답 없음"
         }
     }
 }
@@ -26,106 +24,121 @@ enum ComciganError: Error, LocalizedError {
 actor ComciganClient {
     static let shared = ComciganClient()
 
-    private let mainURL = "http://comcigan.com/st"
-    // 검색 경로 — 메인 페이지에서 동적으로 추출, 없으면 fallback 사용
-    private var searchPath: String = "/st/sch"
+    private let baseURL = "http://comcigan.com"
+    private var resolvedSearchPath: String?
 
-    private func session() -> URLSession {
+    private func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 10
         return URLSession(configuration: cfg)
     }
 
-    // MARK: - 라우팅 경로 추출
+    // MARK: - 메인 페이지에서 실제 검색 경로 추출
 
-    /// 메인 페이지 HTML에서 학교 검색 경로를 추출한다.
-    /// 예: getJSON("st/sch?q=" → searchPath = "/st/sch"
-    private func refreshRouting() async {
-        guard let url = URL(string: mainURL) else { return }
-        guard let (data, _) = try? await session().data(from: url),
-              let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return }
+    private func resolveSearchPath() async -> String? {
+        guard let url = URL(string: "\(baseURL)/st"),
+              let (data, _) = try? await makeSession().data(from: url) else { return nil }
 
-        // 패턴: getJSON("st/sch?q=  또는  $.get("st/sch?q=
-        let patterns = [
-            #"getJSON\("([^"?]+)\?"#,
-            #"get\("([^"?]+)\?"#,
-            #"post\("([^"?]+)\??"#
-        ]
-        for pattern in patterns {
-            if let range = html.range(of: pattern, options: .regularExpression),
-               let innerRange = html.range(of: #"["']([^"'?]+)\?"#, options: .regularExpression, range: range) {
-                var path = String(html[innerRange])
-                // 따옴표·물음표 제거
-                path = path.trimmingCharacters(in: CharacterSet(charactersIn: "\"'?"))
-                if !path.isEmpty {
-                    searchPath = "/" + path
-                    return
-                }
-            }
+        let html = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .isoLatin1) ?? ""
+
+        // JS 코드 예: getJSON("st/sc5?q="+encodeURIComponent(nm)
+        // 숫자 붙은 경로(sc2~sc9)나 sch를 찾는다
+        let pattern = #"["']((?:st/|/)sc\w*)[?]["']"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let r = Range(match.range(at: 1), in: html) {
+            var path = String(html[r])
+            if !path.hasPrefix("/") { path = "/" + path }
+            return path
         }
-        // 정규식 없으면 단순 문자열 탐색
-        if html.contains("st/sch") {
-            searchPath = "/st/sch"
-        }
+        return nil
     }
 
     // MARK: - 학교 검색
 
     func searchSchool(name: String) async throws -> [SchoolResult] {
-        await refreshRouting()
-
-        guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "http://comcigan.com\(searchPath)?q=\(encoded)") else {
-            throw ComciganError.parseError("URL 생성 실패")
+        guard let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            throw ComciganError.parseError("인코딩 실패")
         }
 
-        let data: Data
-        do {
-            (data, _) = try await session().data(from: url)
-        } catch {
-            throw ComciganError.networkError(error)
+        // 첫 호출 시 실제 경로 추출
+        if resolvedSearchPath == nil {
+            resolvedSearchPath = await resolveSearchPath()
         }
 
-        // 실제 컴시간 응답: {"학교": [[교육청코드, 학교코드, "학교명", "지역"], ...]}
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            let raw = String(data: data, encoding: .utf8) ?? "(binary)"
-            throw ComciganError.parseError("JSON 파싱 실패: \(raw.prefix(200))")
+        // 시도 경로 목록: 동적 추출 결과 + 버전별 알려진 경로
+        var candidates: [String] = []
+        if let p = resolvedSearchPath { candidates.append(p) }
+        for p in ["/st/sc5", "/st/sc4", "/st/sc3", "/st/sc2", "/st/sch", "/st/sc"] {
+            if !candidates.contains(p) { candidates.append(p) }
         }
 
-        // 키 이름은 버전마다 다를 수 있으므로 여러 후보 시도
-        let candidateKeys = ["학교", "학교검색", "result", "data"]
-        var rows: [[Any]]?
-        for key in candidateKeys {
-            if let r = json[key] as? [[Any]] {
-                rows = r; break
+        var lastRaw = ""
+        for path in candidates {
+            guard let url = URL(string: "\(baseURL)\(path)?q=\(encoded)"),
+                  let (data, _) = try? await makeSession().data(from: url),
+                  !data.isEmpty else { continue }
+
+            if let results = parseSchoolResponse(data: data), !results.isEmpty {
+                resolvedSearchPath = path   // 성공한 경로 캐시
+                return results
             }
+            lastRaw = String(data: data, encoding: .utf8)?.prefix(300).description ?? ""
         }
 
-        guard let rows else {
-            let keys = json.keys.joined(separator: ", ")
-            throw ComciganError.parseError("학교 목록 키 없음 (응답 키: \(keys))")
+        if lastRaw.isEmpty {
+            throw ComciganError.networkError(URLError(.cannotConnectToHost))
         }
+        throw ComciganError.parseError("응답: \(lastRaw)")
+    }
 
-        if rows.isEmpty { throw ComciganError.schoolNotFound }
+    // MARK: - 응답 파싱 (여러 형식 대응)
+
+    private func parseSchoolResponse(data: Data) -> [SchoolResult]? {
+        // JSON 파싱 (UTF-8, EUC-KR 순)
+        var json: [String: Any]?
+        if let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            json = j
+        } else if let str = String(data: data, encoding: .isoLatin1),
+                  let d2 = str.data(using: .utf8),
+                  let j = try? JSONSerialization.jsonObject(with: d2) as? [String: Any] {
+            json = j
+        }
+        guard let json else { return nil }
+
+        // 키 후보 우선 탐색, 없으면 첫 번째 배열 값 사용
+        let keyCandidates = ["학교", "학교검색", "학교목록", "result", "data", "list"]
+        var rows: [[Any]]?
+        for key in keyCandidates {
+            if let arr = json[key] as? [[Any]] { rows = arr; break }
+        }
+        if rows == nil {
+            rows = json.values.compactMap { $0 as? [[Any]] }.first
+        }
+        guard let rows, !rows.isEmpty else { return nil }
 
         return rows.compactMap { row -> SchoolResult? in
-            guard row.count >= 3 else { return nil }
-            // 형식 A: [Int코드, Int학교코드, String이름, String지역]
-            if let schoolCode = row[1] as? Int,
-               let schoolName = row[2] as? String {
-                let region = (row.count > 3 ? row[3] as? String : nil) ?? ""
-                return SchoolResult(name: schoolName, code: String(schoolCode), region: region)
+            // 형식 A: [Int코드, String이름, String지역]  ← 컴시간 일반
+            if row.count >= 2,
+               let code = (row[0] as? Int).map(String.init),
+               let name = row[1] as? String {
+                let region = row.count > 2 ? (row[2] as? String ?? "") : ""
+                return SchoolResult(name: name, code: code, region: region)
             }
-            // 형식 B: [Int코드, String이름, String지역] (3-element)
-            if let schoolCode = row[0] as? Int,
-               let schoolName = row[1] as? String {
-                let region = (row.count > 2 ? row[2] as? String : nil) ?? ""
-                return SchoolResult(name: schoolName, code: String(schoolCode), region: region)
+            // 형식 B: [Int교육청코드, Int학교코드, String이름, String지역]
+            if row.count >= 3,
+               row[0] is Int,
+               let code = (row[1] as? Int).map(String.init),
+               let name = row[2] as? String {
+                let region = row.count > 3 ? (row[3] as? String ?? "") : ""
+                return SchoolResult(name: name, code: code, region: region)
             }
-            // 형식 C: [String이름, String코드, ...]
-            if let schoolName = row[0] as? String,
-               let schoolCode = row[1] as? String {
-                return SchoolResult(name: schoolName, code: schoolCode, region: "")
+            // 형식 C: [String이름, String코드]
+            if row.count >= 2,
+               let name = row[0] as? String,
+               let code = row[1] as? String {
+                return SchoolResult(name: name, code: code, region: "")
             }
             return nil
         }
@@ -133,41 +146,19 @@ actor ComciganClient {
 
     // MARK: - 시간표 조회
 
-    /// 반환값: [요일인덱스(0=월~4=금)][교시인덱스] = "과목명(선생님)"
     func fetchTimetable(schoolCode: String, grade: Int, classNum: Int) async throws -> [[String]] {
-        guard let url = URL(string: "http://comcigan.com/st/tt?s=\(schoolCode)&g=\(grade)&c=\(classNum)") else {
-            throw ComciganError.parseError("URL 생성 실패")
-        }
+        let paths = ["/st/tt", "/st/tt2", "/st/timetable"]
+        for path in paths {
+            guard let url = URL(string: "\(baseURL)\(path)?s=\(schoolCode)&g=\(grade)&c=\(classNum)"),
+                  let (data, _) = try? await makeSession().data(from: url),
+                  !data.isEmpty,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
 
-        let data: Data
-        do {
-            (data, _) = try await session().data(from: url)
-        } catch {
-            throw ComciganError.networkError(error)
-        }
-
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ComciganError.parseError("시간표 JSON 파싱 실패")
-        }
-
-        // 키 후보
-        let candidateKeys = ["시간표", "timetable", "result", "data"]
-        for key in candidateKeys {
-            if let table = json[key] as? [[String]] {
-                return table
-            }
-            // 숫자 배열인 경우 변환
-            if let table = json[key] as? [[[Any]]] {
-                return table.map { dayRow in
-                    dayRow.map { cell in
-                        if let s = cell.first as? String { return s }
-                        return cell.map { "\($0)" }.joined(separator: " ")
-                    }
-                }
+            for key in ["시간표", "timetable", "result", "data"] {
+                if let table = json[key] as? [[String]] { return table }
             }
         }
-
-        let keys = json.keys.joined(separator: ", ")
-        throw ComciganError.parseError("시간표 키 없음 (응답 키: \(keys))")
+        throw ComciganError.parseError("시간표를 불러올 수 없어요.")
     }
 }
