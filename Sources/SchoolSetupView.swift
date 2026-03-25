@@ -43,7 +43,16 @@ struct SchoolSetupView: View {
             if !results.isEmpty {
                 Section("검색 결과") {
                     ForEach(results) { school in
-                        Button(school.name) { selectSchool(school) }
+                        Button {
+                            selectSchool(school)
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(school.name).foregroundStyle(.primary)
+                                if !school.region.isEmpty {
+                                    Text(school.region).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
                     }
                 }
             }
