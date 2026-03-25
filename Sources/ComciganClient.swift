@@ -3,7 +3,7 @@ import Foundation
 struct SchoolResult: Identifiable {
     let id = UUID()
     let name: String
-    let code: String
+    let code: String   // 학교코드 (숫자)
     let region: String
 }
 
@@ -21,164 +21,219 @@ enum ComciganError: Error, LocalizedError {
     }
 }
 
+// MARK: - EUC-KR 인코딩 헬퍼
+
+private let eucKREncoding = String.Encoding(rawValue:
+    CFStringConvertEncodingToNSStringEncoding(
+        CFStringEncoding(CFStringEncodings.EUC_KR.rawValue)
+    )
+)
+
+private func eucKRHex(_ string: String) -> String {
+    guard let data = string.data(using: eucKREncoding) else { return string }
+    return data.map { String(format: "%%%02x", $0) }.joined()
+}
+
+private func decodeEUCKR(_ data: Data) -> String {
+    if let s = String(data: data, encoding: .utf8) { return s }
+    if let s = String(data: data, encoding: eucKREncoding) { return s }
+    return String(data: data, encoding: .isoLatin1) ?? ""
+}
+
+// MARK: - ComciganClient
+
 actor ComciganClient {
     static let shared = ComciganClient()
 
-    private let base = "http://comcigan.com"
+    // 동적 초기화로 얻는 값
+    private var baseUrl: String?       // e.g. "http://comci.net:4082"
+    private var extractCode: String?   // e.g. "/36179?17384l"
+    private var scData: [String] = []  // e.g. ["73629_", "sc", "1", "0"]
 
-    // 쿠키를 유지하는 전용 URLSession
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.default
-        cfg.httpCookieStorage = HTTPCookieStorage.shared
-        cfg.httpCookieAcceptPolicy = .always
         cfg.timeoutIntervalForRequest = 15
         cfg.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Accept-Language": "ko-KR,ko;q=0.9"
+            "User-Agent": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
         ]
         return URLSession(configuration: cfg)
     }()
 
-    private var sessionReady = false
+    // MARK: - 초기화: 컴시간학생.kr → frame URL → 검색 경로 추출
 
-    // MARK: - PHP 세션 초기화 (PHPSESSID 쿠키 획득)
+    private func ensureInit() async throws {
+        if baseUrl != nil && extractCode != nil { return }
 
-    private func ensureSession() async {
-        guard !sessionReady else { return }
-        guard let url = URL(string: "\(base)/st/") else { return }
-        _ = try? await session.data(from: url)
-        sessionReady = true
+        // Step 1: 메인 페이지에서 frame src 추출
+        // URLComponents 로 한글 도메인 IDNA 인코딩
+        var comps = URLComponents()
+        comps.scheme = "http"
+        comps.host = "컴시간학생.kr"
+        guard let mainUrl = comps.url else {
+            throw ComciganError.parseError("메인 URL 생성 실패")
+        }
+
+        let mainHtml: String
+        do {
+            let (data, _) = try await session.data(from: mainUrl)
+            mainHtml = decodeEUCKR(data)
+        } catch {
+            throw ComciganError.networkError(error)
+        }
+
+        // <frame src="..."> 에서 URL 추출
+        let frameUrl = extractFrameSrc(from: mainHtml)
+        guard let frameUrl else {
+            throw ComciganError.parseError("frame URL을 찾을 수 없음")
+        }
+        guard let frameUrlObj = URL(string: frameUrl) else {
+            throw ComciganError.parseError("frame URL 파싱 실패: \(frameUrl)")
+        }
+
+        // baseUrl = scheme://host:port
+        let port = frameUrlObj.port.map { ":\($0)" } ?? ""
+        baseUrl = "\(frameUrlObj.scheme ?? "http")://\(frameUrlObj.host ?? "")\(port)"
+
+        // Step 2: frame 페이지 소스에서 school_ra, sc_data 추출
+        let source: String
+        do {
+            let (data, _) = try await session.data(from: frameUrlObj)
+            source = decodeEUCKR(data)
+        } catch {
+            throw ComciganError.networkError(error)
+        }
+
+        extractCode = extractSchoolRaPath(from: source)
+        scData = extractScData(from: source)
+
+        guard extractCode != nil else {
+            throw ComciganError.parseError("검색 경로 추출 실패")
+        }
+    }
+
+    // MARK: - HTML 파싱 헬퍼
+
+    private func extractFrameSrc(from html: String) -> String? {
+        // <frame ... src="http://..."  대소문자 무관
+        let lower = html.lowercased().replacingOccurrences(of: "'", with: "\"")
+        guard let regex = try? NSRegularExpression(pattern: #"<frame[^>]+src="([^"]+)""#, options: .caseInsensitive),
+              let m = regex.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)),
+              let r = Range(m.range(at: 1), in: lower) else { return nil }
+        return String(lower[r])
+    }
+
+    private func extractSchoolRaPath(from source: String) -> String? {
+        // school_ra(sc) ... url:'...'  패턴
+        guard let idx = source.range(of: "school_ra(sc)") else { return nil }
+        let snippet = String(source[idx.lowerBound...].prefix(200))
+            .replacingOccurrences(of: " ", with: "")
+        guard let regex = try? NSRegularExpression(pattern: #"url:'([^']+)'"#),
+              let m = regex.firstMatch(in: snippet, range: NSRange(snippet.startIndex..., in: snippet)),
+              let r = Range(m.range(at: 1), in: snippet) else { return nil }
+        return String(snippet[r])
+    }
+
+    private func extractScData(from source: String) -> [String] {
+        // sc_data('73629_','sc','1','0')
+        guard let idx = source.range(of: "sc_data(") else { return [] }
+        let snippet = String(source[idx.lowerBound...].prefix(80))
+        guard let regex = try? NSRegularExpression(pattern: #"\(([^)]+)\)"#),
+              let m = regex.firstMatch(in: snippet, range: NSRange(snippet.startIndex..., in: snippet)),
+              let r = Range(m.range(at: 1), in: snippet) else { return [] }
+        return String(snippet[r])
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "' ")) }
     }
 
     // MARK: - 학교 검색
 
     func searchSchool(name: String) async throws -> [SchoolResult] {
-        await ensureSession()
+        try await ensureInit()
 
-        // EUC-KR URL 인코딩 (컴시간 서버 요구 사항)
-        let eucKR = String.Encoding(rawValue:
-            CFStringConvertEncodingToNSStringEncoding(
-                CFStringEncoding(CFStringEncodings.EUC_KR.rawValue)
-            )
-        )
-        let encodedQuery: String
-        if let data = name.data(using: eucKR) {
-            encodedQuery = data.map { String(format: "%%%02X", $0) }.joined()
-        } else {
-            encodedQuery = name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? name
+        guard let baseUrl, let extractCode else {
+            throw ComciganError.parseError("초기화 실패")
         }
 
-        let urlCandidates = [
-            "\(base)/st/sch?q=\(encodedQuery)",
-            "\(base)/st/sc5?q=\(encodedQuery)",
-            "\(base)/st/sc4?q=\(encodedQuery)",
-        ]
+        // EUC-KR hex 인코딩: '서울' → '%BC%AD%BF%EF'
+        let hexName = eucKRHex(name)
+        let urlStr = "\(baseUrl)\(extractCode)\(hexName)"
 
-        var lastRaw = ""
-
-        for urlStr in urlCandidates {
-            guard let url = URL(string: urlStr) else { continue }
-
-            let data: Data
-            do {
-                (data, _) = try await session.data(from: url)
-            } catch {
-                lastRaw = "네트워크: \(error.localizedDescription)"
-                continue
-            }
-
-            guard !data.isEmpty else { continue }
-
-            // EUC-KR → UTF-8 변환
-            let raw = decodeResponse(data)
-            lastRaw = String(raw.prefix(500))
-
-            if let results = parseSchoolList(raw), !results.isEmpty {
-                return results
-            }
+        guard let url = URL(string: urlStr) else {
+            throw ComciganError.parseError("URL 생성 실패: \(urlStr)")
         }
 
-        throw ComciganError.parseError(lastRaw)
-    }
-
-    // MARK: - EUC-KR 디코딩
-
-    private func decodeResponse(_ data: Data) -> String {
-        if let s = String(data: data, encoding: .utf8) { return s }
-        let eucKR = String.Encoding(rawValue:
-            CFStringConvertEncodingToNSStringEncoding(
-                CFStringEncoding(CFStringEncodings.EUC_KR.rawValue)
-            )
-        )
-        if let s = String(data: data, encoding: eucKR) { return s }
-        return String(data: data, encoding: .isoLatin1) ?? ""
-    }
-
-    // MARK: - 파싱
-
-    private func parseSchoolList(_ raw: String) -> [SchoolResult]? {
-        guard let data = raw.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) else { return nil }
-
-        var rows: [[Any]]?
-
-        // 딕셔너리: {"학교": [[...]]}
-        if let dict = obj as? [String: Any] {
-            for key in ["학교", "학교검색", "학교목록", "result", "data"] {
-                if let r = dict[key] as? [[Any]] { rows = r; break }
-            }
-            if rows == nil {
-                rows = dict.values.compactMap { $0 as? [[Any]] }.first
-            }
+        let data: Data
+        do {
+            (data, _) = try await session.data(from: url)
+        } catch {
+            throw ComciganError.networkError(error)
         }
-        // 최상위 배열: [[...]]
-        if rows == nil, let r = obj as? [[Any]] { rows = r }
 
-        guard let rows, !rows.isEmpty else { return nil }
-        return mapRows(rows)
-    }
+        // JSON 끝 '}'까지만 사용 (컴시간은 뒤에 쓸모없는 데이터 붙음)
+        var raw = decodeEUCKR(data)
+        if let lastBrace = raw.lastIndex(of: "}") {
+            raw = String(raw[...lastBrace])
+        }
 
-    private func mapRows(_ rows: [[Any]]) -> [SchoolResult]? {
+        guard let jsonData = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let rows = json["학교검색"] as? [[Any]] else {
+            throw ComciganError.parseError("응답 파싱 실패: \(raw.prefix(300))")
+        }
+
+        // 행 구조: [_, 지역, 학교이름, 학교코드]
         let results = rows.compactMap { row -> SchoolResult? in
-            guard row.count >= 2 else { return nil }
-            // [Int코드, String이름, String지역]
-            if let code = (row[0] as? Int).map(String.init),
-               let name = row[1] as? String {
-                let region = row.count > 2 ? (row[2] as? String ?? "") : ""
-                return SchoolResult(name: name, code: code, region: region)
-            }
-            // [Int교육청, Int코드, String이름, String지역]
-            if row.count >= 3, row[0] is Int,
-               let code = (row[1] as? Int).map(String.init),
-               let name = row[2] as? String {
-                let region = row.count > 3 ? (row[3] as? String ?? "") : ""
-                return SchoolResult(name: name, code: code, region: region)
-            }
-            // [String이름, String코드]
-            if let name = row[0] as? String, let code = row[1] as? String {
-                return SchoolResult(name: name, code: code, region: "")
-            }
-            return nil
+            guard row.count >= 4,
+                  let schoolName = row[2] as? String, !schoolName.isEmpty,
+                  let codeInt = row[3] as? Int, codeInt != 0 else { return nil }
+            let region = row[1] as? String ?? ""
+            return SchoolResult(name: schoolName, code: String(codeInt), region: region)
         }
-        return results.isEmpty ? nil : results
+
+        if results.isEmpty { throw ComciganError.schoolNotFound }
+        return results
     }
 
     // MARK: - 시간표
 
     func fetchTimetable(schoolCode: String, grade: Int, classNum: Int) async throws -> [[String]] {
-        await ensureSession()
-        let url = URL(string: "\(base)/st/tt?s=\(schoolCode)&g=\(grade)&c=\(classNum)")!
-        guard let (data, _) = try? await session.data(from: url), !data.isEmpty else {
+        try await ensureInit()
+
+        guard let baseUrl, let extractCode, !scData.isEmpty else {
+            throw ComciganError.parseError("초기화 실패")
+        }
+
+        // URL 공식: {extractCode 경로부분}?{base64(scData[0]+schoolCode+"_0_"+scData[2])}
+        let pathPart = extractCode.components(separatedBy: "?").first ?? extractCode
+        let s7 = (scData.first ?? "") + schoolCode
+        let payload = "\(s7)_0_\(scData.count > 2 ? scData[2] : "1")"
+        guard let payloadData = payload.data(using: .utf8) else {
+            throw ComciganError.parseError("payload 인코딩 실패")
+        }
+        let b64 = payloadData.base64EncodedString()
+        let urlStr = "\(baseUrl)\(pathPart)?\(b64)"
+
+        guard let url = URL(string: urlStr),
+              let (data, _) = try? await session.data(from: url),
+              !data.isEmpty else {
             throw ComciganError.parseError("시간표 요청 실패")
         }
-        let raw = decodeResponse(data)
-        guard let jsonData = raw.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
-        else { throw ComciganError.parseError("시간표 파싱 실패") }
 
-        for key in ["시간표", "timetable", "result", "data"] {
+        var raw = decodeEUCKR(data)
+        if let lastBrace = raw.lastIndex(of: "}") { raw = String(raw[...lastBrace]) }
+
+        guard let jsonData = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            throw ComciganError.parseError("시간표 JSON 파싱 실패")
+        }
+
+        // 시간표 파싱은 복잡한 JS eval 필요 — 현재는 기본 구조만 시도
+        for key in ["시간표", "timetable"] {
             if let table = json[key] as? [[String]] { return table }
         }
-        throw ComciganError.parseError("시간표 키 없음")
+
+        // 학급수 확인
+        _ = json["학급수"] as? [Int]
+        throw ComciganError.parseError("시간표 자동 파싱 미지원 — 과목을 직접 추가해 주세요")
     }
 }
